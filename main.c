@@ -15,6 +15,72 @@ static typeof(kvm_arch_vcpu_ioctl_get_sregs) *get_sregs;
 static typeof(kvm_arch_vcpu_ioctl_get_regs) *get_regs;
 static unsigned long original_vcpu_ioctl = 0;
 
+gpa_t map_and_search_pages(gpa_t userspace_addr, unsigned long npages, unsigned long *scanned_count)
+{
+    gpa_t res = 0;
+    int pages_pinned = 0;
+    void *scan_pages = NULL;
+
+    struct page **user_pages = kzalloc(sizeof(void *) * npages, GFP_KERNEL);
+    CHECK(user_pages, "failed to allocate pages pointers");
+
+    pages_pinned = get_user_pages_fast(userspace_addr, npages, 0, user_pages);
+    CHECK(pages_pinned == npages, "failed to pin %ld pages starting from 0x%llx, skipping", npages, userspace_addr);
+
+    scan_pages = vmap(user_pages, npages, GFP_KERNEL, PAGE_KERNEL);
+    CHECK(scan_pages, "failed to map %ld pages starting from 0x%llx, skipping", npages, userspace_addr);
+
+    res = (gpa_t)memmem(scan_pages, PAGE_SIZE * npages, SEARCH_BYTES, sizeof(SEARCH_BYTES) - 1);
+    if (res) {
+        res = userspace_addr + (gpa_t)(scan_pages - res);
+    }
+
+    *scanned_count += npages;
+
+cleanup:
+    if (scan_pages) {
+        vunmap(scan_pages);
+    }
+    if (pages_pinned > 0) {
+        release_pages(user_pages, npages);
+    }
+    if (user_pages) {
+        kfree(user_pages);
+    }
+
+    return res;
+}
+
+gpa_t read_and_search_pages(gpa_t userspace_addr, unsigned long npages, unsigned long *scanned_count)
+{
+    gpa_t res = 0;
+
+    void *scan_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    CHECK(scan_buffer, "failed to allocate scanning buffer");
+
+    for (unsigned long i = 0; i < npages; i++) {
+        void *__user current_page = (void *__user)userspace_addr + i * PAGE_SIZE;
+        int err = __copy_from_user(scan_buffer, current_page, PAGE_SIZE);
+        if (err) {
+            eprintln("failed to read page from userspace address %llx. skipping", (unsigned long long)current_page);
+            continue;
+        }
+
+        res = (gpa_t)memmem(scan_buffer, PAGE_SIZE, SEARCH_BYTES, sizeof(SEARCH_BYTES) - 1);
+        *scanned_count += 1;
+        if (res) {
+            res = (gpa_t)current_page + (gpa_t)(scan_buffer - res);
+            break;
+        }
+    }
+
+cleanup:
+    if (scan_buffer) {
+        kfree(scan_buffer);
+    }
+    return res;
+}
+
 static void vcpu_ioctl_handler(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
     int res;
@@ -33,6 +99,7 @@ static void vcpu_ioctl_handler(struct file *filp, unsigned int ioctl, unsigned l
         struct kvm *kvm = vcpu->kvm;
         CHECK(kvm, "vcpu->kvm is NULL");
 
+        // get special registers to ensure guest is in kernel mode
 		struct kvm_sregs *sregs = kzalloc(sizeof(struct kvm_sregs), GFP_KERNEL);
         CHECK(sregs, "failed to allocate sregs");
 
@@ -40,6 +107,7 @@ static void vcpu_ioctl_handler(struct file *filp, unsigned int ioctl, unsigned l
         CHECK_OR(!res, free_sregs, "kvm_arch_vcpu_ioctl_get_sregs failed with %d", res);
         CHECK_OR(0 == (sregs->cs.base & 3), free_sregs, "guest is not in kernel mode");
 
+        // get all mapped memory regions for this guest
         struct kvm_memslots *memslots = kvm->memslots[0];
         CHECK_OR(memslots, free_sregs, "memslots is NULL");
 
@@ -48,51 +116,28 @@ static void vcpu_ioctl_handler(struct file *filp, unsigned int ioctl, unsigned l
         getnstimeofday(&scan_time);
 
         gpa_t addr = 0;
-        unsigned pages_scanned = 0;
+        unsigned long pages_scanned = 0;
         struct kvm_memory_slot *memslot;
         kvm_for_each_memslot(memslot, memslots) {
             println("scanning memslot: userspace address=%lx, pages=%ld, guest page=%llu",
                     memslot->userspace_addr, memslot->npages, memslot->base_gfn);
 
-            void *_addr = NULL;
-            int pages_pinned = 0;
-            void *scan_pages = NULL;
-
-		    struct page **user_pages = kzalloc(sizeof(void *) * memslot->npages, GFP_KERNEL);
-            CHECK_OR(user_pages, next_memslot, "failed to allocate pages pointers");
-
-            pages_pinned = __get_user_pages_fast(memslot->userspace_addr, memslot->npages, 0, user_pages);
-            CHECK_OR(pages_pinned == memslot->npages, next_memslot,
-                    "failed to pin %ld pages starting from 0x%lx, skipping", memslot->npages, memslot->userspace_addr);
-
-            scan_pages = vmap(user_pages, memslot->npages, GFP_KERNEL, PAGE_KERNEL);
-            CHECK_OR(scan_pages, next_memslot,
-                    "failed to map %ld pages starting from 0x%lx, skipping", memslot->npages, memslot->userspace_addr);
-
-            _addr = memmem(scan_pages, PAGE_SIZE * memslot->npages, SEARCH_BYTES, sizeof(SEARCH_BYTES) - 1);
-            pages_scanned += memslot->npages;
-
-next_memslot:
-            if (scan_pages) {
-                vunmap(scan_pages);
-            }
-            if (pages_pinned > 0) {
-                release_pages(user_pages, memslot->npages);
-            }
-            if (user_pages) {
-                kfree(user_pages);
+            addr = map_and_search_pages(memslot->userspace_addr, memslot->npages, &pages_scanned);
+            if (IS_ERR_VALUE(addr)) {
+                println("falling back to kvm_guest_read()");
+                addr = read_and_search_pages(memslot->userspace_addr, memslot->npages, &pages_scanned);
             }
 
-            if (_addr) {
-                addr = memslot->userspace_addr + (_addr - scan_pages);
+            if (addr) {
                 break;
             }
         }
 
         struct timespec now;
         getnstimeofday(&now);
-        println("finished scanning %u pages in %ld.%09ld seconds",
+        println("finished scanning %lu pages (~%lu MB) in %ld.%09ld seconds",
                 pages_scanned,
+                (pages_scanned * PAGE_SIZE) / (1 << 20),
                 now.tv_sec - scan_time.tv_sec,
                 (1000000000 + now.tv_nsec - scan_time.tv_nsec) % 1000000000);
 
